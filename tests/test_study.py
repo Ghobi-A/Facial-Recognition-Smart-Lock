@@ -1,18 +1,21 @@
 import numpy as np
 import pytest
 
-from edgeauth.study import embedders, lfw
-from edgeauth.study.analysis import pair_groups
+from edgeauth.study import datasets, dense, embedders, lfw
+from edgeauth.study.analysis import image_conditions
 from edgeauth.study.stats import (
     Scores,
     auc,
-    bootstrap_mean,
     cross_calibrated,
     eer,
     far,
     frr,
+    pair_bootstrap,
+    person_bootstrap,
+    person_draws,
+    sweep,
+    threshold_at_far,
     threshold_for_cost,
-    threshold_for_far,
 )
 
 
@@ -30,7 +33,7 @@ def test_perfect_separation():
     scores = separable()
     assert eer(scores)[0] == 0
     assert auc(scores) == pytest.approx(1.0)
-    threshold = threshold_for_far(scores, 0.0)
+    threshold = threshold_at_far(scores.impostor, 0.0)
     assert far(scores.impostor, threshold) == 0 and frr(scores.genuine, threshold) == 0
 
 
@@ -39,6 +42,21 @@ def test_eer_on_overlapping_scores():
     value, threshold = eer(scores)
     assert value == pytest.approx(0.25)
     assert far(scores.impostor, threshold) == pytest.approx(frr(scores.genuine, threshold))
+
+
+def test_weighted_sweep_with_unit_weights_matches_unweighted():
+    rng = np.random.default_rng(3)
+    plain = Scores(rng.normal(0.6, 0.2, 50), np.r_[rng.normal(0.2, 0.2, 49), np.nan])
+    weighted = Scores(plain.genuine, plain.impostor, np.ones(50), np.ones(50))
+    for left, right in zip(sweep(plain), sweep(weighted)):
+        np.testing.assert_allclose(left, right)
+
+
+def test_weights_act_like_duplicates():
+    scores = Scores(np.array([0.9, 0.5]), np.array([0.6, 0.1]))
+    duplicated = Scores(np.array([0.9, 0.5, 0.5]), np.array([0.6, 0.1]))
+    weighted = Scores(scores.genuine, scores.impostor, np.array([1.0, 2.0]), np.ones(2))
+    assert eer(weighted)[0] == pytest.approx(eer(duplicated)[0])
 
 
 def test_cost_threshold_prefers_rejecting_strangers():
@@ -50,21 +68,80 @@ def test_cost_threshold_prefers_rejecting_strangers():
     assert far(scores.impostor, strict) < far(scores.impostor, balanced)
 
 
+def test_dense_threshold_hits_target_far():
+    impostor = np.random.default_rng(1).normal(0.0, 0.1, 200_000)
+    for target in (1e-2, 1e-3, 1e-4):
+        threshold = threshold_at_far(impostor, target)
+        assert far(impostor, threshold) <= target
+        assert far(impostor, threshold) == pytest.approx(target, rel=0.05)
+
+
 def test_cross_calibration_is_out_of_sample():
-    # Half 0 is easy, half 1 is shifted: each half must be judged by the other's threshold.
     genuine = np.array([0.9, 0.8, 0.5, 0.4])
     impostor = np.array([0.2, 0.1, 0.45, 0.35])
     half = np.array([0, 0, 1, 1])
-    _, _, used = cross_calibrated(Scores(genuine, impostor), half, half, "far_1pct")
-    assert used[0] == pytest.approx(0.5)  # chosen on half 1 only
-    assert used[1] == pytest.approx(0.8)  # chosen on half 0 only
+    _, _, used = cross_calibrated(Scores(genuine, impostor), half, half, "eer")
+    # half 1 is judged by half 0's EER threshold and vice versa
+    assert used[1] == pytest.approx(eer(Scores(genuine[:2], impostor[:2]))[1])
+    assert used[0] == pytest.approx(eer(Scores(genuine[2:], impostor[2:]))[1])
+    g, i, fixed = cross_calibrated(Scores(genuine, impostor), half, half, [0.85, 0.42])
+    assert fixed == [0.85, 0.42]
+    assert list(g) == [True, False, True, False] and list(i) == [False, False, True, False]
 
 
-def test_bootstrap_interval_brackets_estimate():
-    point, low, high = bootstrap_mean(np.r_[np.ones(10), np.zeros(90)], np.random.default_rng(1))
-    assert point == pytest.approx(0.1)
+def test_person_bootstrap_matches_pair_bootstrap_for_singletons():
+    rng = np.random.default_rng(5)
+    outcomes = (rng.random(400) < 0.1).astype(float)
+    people = np.arange(400)
+    draws = person_draws(400, np.random.default_rng(6), 2000)
+    person = person_bootstrap(outcomes, people, people, draws)
+    pair = pair_bootstrap(outcomes, np.random.default_rng(7))
+    assert person[0] == pair[0]
+    assert person[2] - person[1] == pytest.approx(pair[2] - pair[1], rel=0.15)
+
+
+def test_person_bootstrap_widens_for_repeated_people():
+    # 40 people with 10 pairs each, outcomes perfectly correlated within a person
+    people = np.repeat(np.arange(40), 10)
+    outcomes = (people < 8).astype(float)
+    draws = person_draws(40, np.random.default_rng(1), 2000)
+    person = person_bootstrap(outcomes, people, people, draws)
+    pair = pair_bootstrap(outcomes, np.random.default_rng(1))
+    assert person[2] - person[1] > 2 * (pair[2] - pair[1])
+
+
+def test_dense_far_matches_brute_force():
+    rng = np.random.default_rng(2)
+    vectors = rng.normal(size=(30, 4))
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    vectors[3] = np.nan  # failure to acquire: an attempt that can never be accepted
+    person = np.repeat(np.arange(10), 3)
+    block = dense.Block(vectors, person, np.arange(10), "cosine")
+    threshold = 0.3
+    brute_hits = brute_attempts = 0
+    for i in range(30):
+        for j in range(i + 1, 30):
+            if person[i] != person[j]:
+                brute_attempts += 1
+                brute_hits += np.nan_to_num(vectors[i] @ vectors[j], nan=-np.inf) >= threshold
+    assert len(block.impostor_scores()) == brute_attempts
+    draws = person_draws(10, np.random.default_rng(0), 200)
+    matrix = dense.accepted_matrix(block, threshold)
+    point, low, high = dense.far_with_ci([block], [matrix], draws)
+    assert point == pytest.approx(brute_hits / brute_attempts)
     assert low <= point <= high
-    assert bootstrap_mean(np.array([]), np.random.default_rng(1)) == (None, None, None)
+    flagged = np.zeros(30, dtype=bool)
+    flagged[:6] = True
+    masked = dense.accepted_matrix(block, threshold, flagged)
+    hits = attempts = 0
+    for i in range(30):
+        for j in range(i + 1, 30):
+            if person[i] != person[j] and (flagged[i] or flagged[j]):
+                attempts += 1
+                hits += np.nan_to_num(vectors[i] @ vectors[j], nan=-np.inf) >= threshold
+    assert dense.far_with_ci([block], [masked], draws, image_masks=[flagged])[0] == (
+        pytest.approx(hits / attempts)
+    )
 
 
 def test_pairs_protocol_parsing(tmp_path):
@@ -80,29 +157,34 @@ def test_pairs_protocol_parsing(tmp_path):
     assert lfw.read_manifest(manifest) == rows
 
 
-def attribute_scores(male: float, white: float, glasses: float = -1.0) -> dict:
-    scores = {name: -1.0 for name in ("Asian", "Black", "Indian", *lfw.AGE, *lfw.BINARY.values())}
-    scores.update({"Male": male, "White": white, "Eyeglasses": glasses, "Youth": 1.0})
-    return scores
-
-
-def test_subgroups_require_both_impostors_in_group():
-    attributes = {
-        "Ann/Ann_0001.jpg": attribute_scores(-1, 2, glasses=1),
-        "Ann/Ann_0002.jpg": attribute_scores(-1, 2),
-        "Bob/Bob_0001.jpg": attribute_scores(1, 2),
-    }
-    people = lfw.person_groups(attributes)
+def test_dataset_round_trip_and_leakage_check(tmp_path):
     rows = [
-        lfw.PairRow(0, 1, True, "Ann", "Ann/Ann_0001.jpg", "Ann", "Ann/Ann_0002.jpg"),
-        lfw.PairRow(1, 1, False, "Ann", "Ann/Ann_0002.jpg", "Bob", "Bob/Bob_0001.jpg"),
+        lfw.PairRow(0, 1, True, "Ann", "Ann/1.jpg", "Ann", "Ann/2.jpg"),
+        lfw.PairRow(1, 2, False, "Ann", "Ann/1.jpg", "Bob", "Bob/1.jpg"),
     ]
-    yaw = {"Ann/Ann_0001.jpg": 0.05, "Ann/Ann_0002.jpg": 0.4, "Bob/Bob_0001.jpg": 0.0}
-    genuine, impostor = pair_groups(rows, attributes, people, yaw)
-    assert genuine["sex"] == "female" and genuine["eyeglasses"] == "yes"
-    assert genuine["pose"] == "turned"
-    assert "sex" not in impostor  # female vs male impostor is not a same-group attempt
-    assert impostor["ethnicity"] == "white"
+    people = {"Ann": {"sex": "female"}, "Bob": {"sex": "male", "ethnicity": "white"}}
+    images = {"Ann/1.jpg": {"blurry": "yes"}, "Bob/1.jpg": {"blurry": "no"}}
+    datasets.write(tmp_path, {"name": "toy", "image_root": "."}, rows, people, images)
+    loaded = datasets.load(tmp_path)
+    assert loaded.rows == rows and loaded.people == people and loaded.images == images
+    leaky = rows + [lfw.PairRow(2, 7, True, "Bob", "Bob/1.jpg", "Bob", "Bob/2.jpg")]
+    with pytest.raises(ValueError, match="identity leakage"):
+        datasets.write(tmp_path, {"name": "toy", "image_root": "."}, leaky, people, images)
+
+
+def test_balanced_pairs_stay_inside_halves():
+    images = {f"p{i}": [f"p{i}/{j}.jpg" for j in range(4)] for i in range(40)}
+    rows = datasets.balanced_pairs(images, "salt", per_person=3, seed=0)
+    datasets.check_disjoint(rows)
+    genuine = sum(r.genuine for r in rows)
+    assert genuine == 120 and len(rows) == 240
+
+
+def test_image_conditions_include_pose():
+    data = datasets.Dataset("toy", None, {}, [], {}, {"a.jpg": {"blurry": "yes"}})
+    flags = image_conditions(data, {"a.jpg": 0.5, "b.jpg": 0.0, "c.jpg": float("nan")})
+    assert flags["blurry"] == {"a.jpg": True}
+    assert flags["pose_turned"] == {"a.jpg": True, "b.jpg": False}
 
 
 def test_pair_scores_orientation():

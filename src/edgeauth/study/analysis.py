@@ -1,193 +1,231 @@
-"""Turn cached embeddings into the study's results: overall metrics, operating points, subgroups."""
+"""Turn cached embeddings into the study's results, for any prepared dataset.
+
+Per model:
+* EER / AUC on the dataset's pairs, with person-level bootstrap intervals;
+* operating points: pair-calibrated (EER, cost 10:1, the 2022 default for dlib) and
+  security-constrained (FAR = 1e-2, 1e-3, 1e-4, calibrated on the other half's dense impostors);
+  each reports out-of-sample FRR (genuine pairs) and FAR (dense stranger pairs);
+* subgroups at the cost-based and FAR=1e-3 policies: FRR from genuine pairs, FAR from *every*
+  same-group stranger pair in the dense sets.
+"""
 
 from pathlib import Path
 
 import numpy as np
 
-from . import embedders, lfw
+from . import dense, embedders, lfw
+from .datasets import DEMOGRAPHIC_KEYS, Dataset, half_of
 from .stats import (
-    POLICIES,
+    FAR_TARGETS,
     Scores,
-    bootstrap_curve_stats,
-    bootstrap_mean,
     cross_calibrated,
+    pair_bootstrap,
+    person_bootstrap,
+    person_curve_stats,
+    person_draws,
     sweep,
 )
 
 YAW_TURNED = 0.2  # |nose offset| above 0.2 inter-ocular distances counts as a turned head
 LEGACY_DLIB_DISTANCE = 0.6  # face_recognition's default tolerance, used unchanged in 2022
-SUBGROUP_POLICY = "cost_10to1"
+SUBGROUP_POLICIES = ("cost_10to1", "far_1e-03")
+BOOTSTRAP_REPS = 1000
 
 
-def pair_groups(
-    rows: list[lfw.PairRow],
-    attributes: dict[str, dict[str, float]],
-    people: dict[str, dict[str, str]],
-    yaw: dict[str, float],
-) -> list[dict[str, str]]:
-    """Subgroup labels per pair.
-
-    Demographic labels (sex, ethnicity) are per person; an impostor pair belongs to a group only
-    when both people do, because same-demographic impostors are the hard, relevant case. Capture
-    conditions (glasses, lighting, blur, pose) are per image; a pair has a condition if either
-    image does.
-    """
-    labelled = []
-    for row in rows:
-        groups = {}
-        a, b = people.get(row.person_a), people.get(row.person_b)
-        for key in ("sex", "ethnicity"):
-            if a and b and a[key] == b[key]:
-                groups[key] = a[key]
-        images = [attributes.get(row.image_a), attributes.get(row.image_b)]
-        if all(images):
-            labels = [lfw.image_groups(scores) for scores in images]
-            for key in lfw.BINARY:
-                groups[key] = "yes" if "yes" in (labels[0][key], labels[1][key]) else "no"
-        yaws = [yaw.get(row.image_a, np.nan), yaw.get(row.image_b, np.nan)]
-        if all(np.isfinite(yaws)):
-            groups["pose"] = "turned" if max(abs(v) for v in yaws) > YAW_TURNED else "frontal"
-        labelled.append(groups)
-    return labelled
+def policy_name(target: float) -> str:
+    return f"far_{target:.0e}"
 
 
-MATCHED_IMPOSTORS_PER_GROUP = 2000
+def image_conditions(dataset: Dataset, yaw: dict[str, float]) -> dict[str, dict[str, bool]]:
+    """Per condition key, image -> flagged. Pose comes from detector landmarks (SFace run)."""
+    conditions: dict[str, dict[str, bool]] = {}
+    for image, labels in dataset.images.items():
+        for key, value in labels.items():
+            conditions.setdefault(key, {})[image] = value == "yes"
+    if yaw:
+        conditions["pose_turned"] = {
+            image: bool(abs(value) > YAW_TURNED)
+            for image, value in yaw.items()
+            if np.isfinite(value)
+        }
+    return conditions
 
 
-def matched_impostors(
-    rows: list[lfw.PairRow], people: dict[str, dict[str, str]], seed: int
-) -> list[tuple[int, str, str, str, str]]:
-    """Supplementary same-demographic impostor pairs: (half, key, value, image_a, image_b).
-
-    LFW's official impostor pairs are random, so same-ethnicity strangers are rare (a handful
-    for minority groups). Matched strangers are the realistic threat and where demographic
-    false-match differentials show up, so we sample them explicitly. Sampling stays inside
-    each identity-disjoint half, so each pair is scored with the *other* half's threshold.
-    """
-    rng = np.random.default_rng(seed)
-    images: dict[tuple[int, str], set[str]] = {}
-    for row in rows:
-        half = 0 if row.fold <= 5 else 1
-        images.setdefault((half, row.person_a), set()).add(row.image_a)
-        images.setdefault((half, row.person_b), set()).add(row.image_b)
-    pairs = []
-    for half in (0, 1):
-        persons = sorted(p for h, p in images if h == half and p in people)
-        for key in ("sex", "ethnicity"):
-            for value in sorted({people[p][key] for p in persons}):
-                group = [p for p in persons if people[p][key] == value]
-                if len(group) < 2:
-                    continue
-                target = min(MATCHED_IMPOSTORS_PER_GROUP // 2, len(group) * (len(group) - 1) // 2)
-                seen = set()
-                while len(seen) < target:
-                    a, b = sorted(rng.choice(len(group), size=2, replace=False))
-                    seen.add((group[a], group[b]))
-                for a, b in sorted(seen):
-                    pick = lambda person: rng.choice(sorted(images[half, person]))  # noqa: E731
-                    pairs.append((half, key, value, str(pick(a)), str(pick(b))))
-    return pairs
-
-
-def model_scores(model: str, rows: list[lfw.PairRow], embedding_dir: Path):
-    index, vectors, yaw = embedders.load(embedding_dir / f"{model}.npz")
-    a = np.array([index[row.image_a] for row in rows])
-    b = np.array([index[row.image_b] for row in rows])
-    acquired = np.all(np.isfinite(vectors), axis=1)
-    return embedders.pair_scores(model, vectors, a, b), acquired, index, yaw
-
-
-def analyse(manifest: Path, attributes_path: Path, embedding_dir: Path, seed: int = 2022) -> dict:
-    rows = lfw.read_manifest(manifest)
+def analyse(dataset: Dataset, embedding_dir: Path, seed: int = 2022) -> dict:
+    rows = dataset.rows
     genuine = np.array([row.genuine for row in rows])
-    half = np.array([0 if row.fold <= 5 else 1 for row in rows])
-    attributes = lfw.parse_attributes(attributes_path)
-    people = lfw.person_groups(attributes)
+    half = np.array([half_of(row.fold) for row in rows])
+    people = sorted({r.person_a for r in rows} | {r.person_b for r in rows})
+    person_id = {person: i for i, person in enumerate(people)}
+    pa = np.array([person_id[r.person_a] for r in rows])
+    pb = np.array([person_id[r.person_b] for r in rows])
+    draws = person_draws(len(people), np.random.default_rng(seed), BOOTSTRAP_REPS)
 
-    _, _, sface_index, sface_yaw = model_scores("sface-fp32", rows, embedding_dir)
-    yaw = {image: float(sface_yaw[i]) for image, i in sface_index.items()}
-    groups = pair_groups(rows, attributes, people, yaw)
-    matched = matched_impostors(rows, people, seed)
+    yaw = {}
+    if (embedding_dir / "sface-fp32.npz").exists():
+        index, _, yaw_values = embedders.load(embedding_dir / "sface-fp32.npz")
+        if yaw_values is not None:
+            yaw = {image: float(yaw_values[i]) for image, i in index.items()}
+    conditions = image_conditions(dataset, yaw)
+
+    # images of each half, for the dense impostor sets
+    half_images: list[dict[str, str]] = [{}, {}]
+    for row in rows:
+        h = half_of(row.fold)
+        half_images[h][row.image_a] = row.person_a
+        half_images[h][row.image_b] = row.person_b
 
     results = {
-        "dataset": "LFW, official 10-fold pairs (6,000 pairs: 3,000 genuine, 3,000 impostor)",
-        "manifest_sha256": lfw.manifest_digest(manifest),
-        "protocol": "two-fold cross-calibration: folds 1-5 <-> 6-10 (identity-disjoint)",
+        "dataset": dataset.name,
+        "description": dataset.meta.get("description"),
+        "labels": dataset.meta.get("labels"),
+        "manifest_sha256": lfw.manifest_digest(dataset.manifest),
+        "people": len(people),
+        "pairs": len(rows),
+        "genuine_pairs": int(genuine.sum()),
+        "protocol": "two-fold cross-calibration over identity-disjoint halves (folds 1-5 <-> 6-10)",
+        "uncertainty": f"95% person-level (pigeonhole) bootstrap, {BOOTSTRAP_REPS} resamples; "
+        "pair-level intervals kept as *_pair_ci for comparison",
         "seed": seed,
-        "matched_impostors": "up to 2,000 same-sex / same-ethnicity stranger pairs per group, "
-        "sampled within each half and scored with the other half's threshold",
         "models": {},
     }
+
     for model in embedders.MODELS:
-        if not (embedding_dir / f"{model}.npz").exists():
+        path = embedding_dir / f"{model}.npz"
+        if not path.exists():
             continue
         rng = np.random.default_rng(seed)
-        raw, acquired, index, _ = model_scores(model, rows, embedding_dir)
+        index, vectors, _ = embedders.load(path)
+        ia = np.array([index[r.image_a] for r in rows])
+        ib = np.array([index[r.image_b] for r in rows])
+        raw = embedders.pair_scores(model, vectors, ia, ib)
         scores = Scores(raw[genuine], raw[~genuine])
-        used_images = sorted({row.image_a for row in rows} | {row.image_b for row in rows})
-        fta = 1 - np.mean([acquired[index[image]] for image in used_images])
+        g_people, i_people = (pa[genuine], pb[genuine]), (pa[~genuine], pb[~genuine])
+        used_images = sorted(set(index) & ({r.image_a for r in rows} | {r.image_b for r in rows}))
+        acquired = np.all(np.isfinite(vectors[[index[i] for i in used_images]]), axis=1)
+
+        blocks = []
+        for h in (0, 1):
+            images = sorted(half_images[h])
+            local = {p: i for i, p in enumerate(sorted(set(half_images[h].values())))}
+            blocks.append(
+                dense.Block(
+                    vectors[[index[i] for i in images]],
+                    np.array([local[half_images[h][i]] for i in images]),
+                    np.array([person_id[p] for p in sorted(local, key=local.get)]),
+                    "cosine" if embedders.SCORING[model] == "cosine" else "euclidean",
+                )
+            )
+        block_images = [sorted(half_images[h]) for h in (0, 1)]
 
         thresholds, far_curve, frr_curve = sweep(scores)
         keep = np.unique(np.linspace(0, len(thresholds) - 1, 400).astype(int))
+        curve_stats = person_curve_stats(scores, g_people, i_people, draws[:500])
         entry = {
             "scoring": embedders.SCORING[model],
-            "failure_to_acquire": float(fta),
-            "pairs_with_fta": int(np.sum(~np.isfinite(raw))),
-            **bootstrap_curve_stats(scores, rng),
-            "curve": {
-                "far": far_curve[keep].tolist(),
-                "frr": frr_curve[keep].tolist(),
-            },
+            "failure_to_acquire": float(1 - acquired.mean()),
+            "dense_impostor_pairs": [int(len(b.impostor_scores())) for b in blocks],
+            **curve_stats,
+            "curve": {"far": far_curve[keep].tolist(), "frr": frr_curve[keep].tolist()},
             "operating_points": {},
             "subgroups": {},
         }
 
-        decisions = {}
-        for policy in POLICIES:
-            g_accept, i_accept, used = cross_calibrated(
-                scores, half[genuine], half[~genuine], policy
-            )
-            decisions[policy] = (g_accept, i_accept, used)
-            entry["operating_points"][policy] = {
-                "thresholds": used,
-                "far": bootstrap_mean(i_accept, rng),
-                "frr": bootstrap_mean(~g_accept, rng),
-            }
+        policies: dict[str, list[float]] = {}
+        for name in ("eer", "cost_10to1"):
+            _, _, used = cross_calibrated(scores, half[genuine], half[~genuine], name)
+            policies[name] = used
+        for target, used in dense.thresholds_at_far(blocks, FAR_TARGETS).items():
+            policies[policy_name(target)] = used
         if model == "dlib-legacy":
-            g_accept = np.nan_to_num(scores.genuine, nan=-np.inf) >= -LEGACY_DLIB_DISTANCE
-            i_accept = np.nan_to_num(scores.impostor, nan=-np.inf) >= -LEGACY_DLIB_DISTANCE
-            entry["operating_points"]["legacy_default_0.6"] = {
-                "thresholds": [-LEGACY_DLIB_DISTANCE],
-                "far": bootstrap_mean(i_accept, rng),
-                "frr": bootstrap_mean(~g_accept, rng),
+            policies["legacy_default_0.6"] = [-LEGACY_DLIB_DISTANCE] * 2
+
+        accepted_blocks = {}
+        for name, used in policies.items():
+            g_accept, i_accept, _ = cross_calibrated(scores, half[genuine], half[~genuine], used)
+            accepted_blocks[name] = [dense.accepted_matrix(b, t) for b, t in zip(blocks, used)]
+            entry["operating_points"][name] = {
+                "thresholds": used,
+                "frr": person_bootstrap(~g_accept, *g_people, draws),
+                "frr_pair_ci": pair_bootstrap(~g_accept, rng),
+                "far": dense.far_with_ci(blocks, accepted_blocks[name], draws),
+                "far_protocol_pairs": person_bootstrap(i_accept, *i_people, draws),
             }
 
-        g_accept, i_accept, used = decisions[SUBGROUP_POLICY]
-        _, vectors, _ = embedders.load(embedding_dir / f"{model}.npz")
-        ma = np.array([index[m[3]] for m in matched])
-        mb = np.array([index[m[4]] for m in matched])
-        matched_scores = embedders.pair_scores(model, vectors, ma, mb)
-        matched_threshold = np.array([used[m[0]] for m in matched])
-        matched_accept = np.nan_to_num(matched_scores, nan=-np.inf) >= matched_threshold
-        genuine_groups = [g for g, is_genuine in zip(groups, genuine) if is_genuine]
-        impostor_groups = [g for g, is_genuine in zip(groups, genuine) if not is_genuine]
-        keys = sorted({key for g in groups for key in g})
-        for key in keys:
-            values = sorted({g[key] for g in groups if key in g})
-            table = {}
-            for value in values:
-                gm = np.array([g.get(key) == value for g in genuine_groups])
-                im = np.array([g.get(key) == value for g in impostor_groups])
-                table[value] = {
-                    "genuine_pairs": int(gm.sum()),
-                    "impostor_pairs": int(im.sum()),
-                    "frr": bootstrap_mean(~g_accept[gm], rng),
-                    "far": bootstrap_mean(i_accept[im], rng),
-                }
-                if key in ("sex", "ethnicity"):
-                    mm = np.array([m[1] == key and m[2] == value for m in matched])
-                    table[value]["matched_impostor_pairs"] = int(mm.sum())
-                    table[value]["far_matched"] = bootstrap_mean(matched_accept[mm], rng)
-            entry["subgroups"][key] = table
+        for name in SUBGROUP_POLICIES:
+            used = policies[name]
+            g_accept, _, _ = cross_calibrated(scores, half[genuine], half[~genuine], used)
+            groups: dict[str, dict] = {}
+            for key in DEMOGRAPHIC_KEYS:
+                values = sorted(
+                    {dataset.people[p][key] for p in people if key in dataset.people.get(p, {})}
+                )
+                for value in values:
+                    member = np.array([dataset.people.get(p, {}).get(key) == value for p in people])
+                    gm = member[g_people[0]]
+                    groups.setdefault(key, {})[value] = {
+                        "people": int(member.sum()),
+                        "genuine_pairs": int(gm.sum()),
+                        "frr": person_bootstrap(
+                            ~g_accept[gm], g_people[0][gm], g_people[1][gm], draws
+                        ),
+                        "far": dense.far_with_ci(
+                            blocks, accepted_blocks[name], draws, people_mask=member
+                        ),
+                    }
+            for key, flags in conditions.items():
+                for value in (True, False):
+                    pair_flag = np.array(
+                        [flags.get(r.image_a, False) or flags.get(r.image_b, False) for r in rows]
+                    )
+                    known = np.array([r.image_a in flags and r.image_b in flags for r in rows])
+                    gm = (pair_flag == value)[genuine] & known[genuine]
+                    cell = {
+                        "genuine_pairs": int(gm.sum()),
+                        "frr": person_bootstrap(
+                            ~g_accept[gm], g_people[0][gm], g_people[1][gm], draws
+                        ),
+                    }
+                    if value:  # dense FAR for pairs where either image has the condition
+                        masks = [
+                            np.array([flags.get(i, False) for i in imgs]) for imgs in block_images
+                        ]
+                        matrices = [
+                            dense.accepted_matrix(b, t, m) for b, t, m in zip(blocks, used, masks)
+                        ]
+                        cell["far"] = dense.far_with_ci(blocks, matrices, draws, image_masks=masks)
+                    else:  # neither image flagged: complement, flag the clean images instead
+                        masks = [
+                            np.array([not flags.get(i, True) for i in imgs])
+                            for imgs in block_images
+                        ]
+                        both_clean = [
+                            dense.accepted_matrix(b, t) - dense.accepted_matrix(b, t, ~m)
+                            for b, t, m in zip(blocks, used, masks)
+                        ]
+                        cell["far"] = _far_both(blocks, both_clean, masks, draws)
+                    groups.setdefault(key, {})["yes" if value else "no"] = cell
+            entry["subgroups"][name] = groups
         results["models"][model] = entry
     return results
+
+
+def _far_both(blocks, matrices, clean_masks, draws) -> tuple:
+    """FAR over stranger pairs where *both* images are clean (complement of 'either flagged')."""
+    numerator = np.zeros(len(draws))
+    denominator = np.zeros(len(draws))
+    accepted_total = attempts_total = 0.0
+    for block, matrix, clean in zip(blocks, matrices, clean_masks):
+        m = np.bincount(block.person, weights=clean, minlength=len(block.people)).astype(float)
+        c = draws[:, block.people]
+        numerator += np.asarray(((matrix @ c.T).T * c).sum(axis=1)).ravel()
+        denominator += (c @ m) ** 2 - (c**2) @ (m**2)
+        accepted_total += matrix.sum()
+        attempts_total += m.sum() ** 2 - (m**2).sum()
+    if attempts_total == 0:
+        return (None, None, None)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        estimates = numerator / denominator
+    estimates = estimates[np.isfinite(estimates)]
+    low, high = np.percentile(estimates, dense.CONFIDENCE)
+    return (float(accepted_total / attempts_total), float(low), float(high))

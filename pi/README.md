@@ -17,22 +17,34 @@ pip install -e '.[legacy]'   # optional: builds dlib from source, ~30-60 min on 
 ## 2. Benchmark
 
 ```bash
-bash pi/run_benchmark.sh pi5      # or pi4; the label names the results file
+bash pi/run_benchmark.sh pi5        # or pi4; the label names the results file
+bash pi/run_benchmark.sh pi5 600    # optional: a 10-minute sustained run per model
 ```
 
-This downloads LFW (~180 MB) if needed and times 200 verification probes per model, each
-model in a fresh process. It writes `reports/results/benchmark_pi5.json` and
-`reports/figures/tradeoff_pi5.png`. Accuracy does not need re-running on the Pi: the
-embeddings are deterministic, so accuracy comes from the full LFW run on any machine.
+The script downloads LFW (~180 MB) if needed. It then times 200 verification probes per
+model, each model in a fresh process, and runs each model flat out for 5 minutes. During the
+sustained run it records throughput, SoC temperature and board power every second, along
+with the Pi's throttle flags. It writes:
 
-**Power:** on a Pi 5 the script samples board power from the PMIC (`vcgencmd pmic_read_adc`)
-at idle and under load. On a Pi 4 there is no on-board sensor, so the power fields are
-`null`; record them with a USB-C power meter instead and add them to the JSON by hand,
-noting the meter used.
+* `reports/results/benchmark_pi5.json`: latency p50/p95, throughput, peak memory, model size,
+  power, the per-second sustained series, throughput drift (first vs last minute), peak
+  temperature and the throttle bitmask;
+* `reports/figures/tradeoff_pi5.png`: accuracy against latency and model size;
+* `reports/figures/thermal_pi5.png`: throughput and temperature over the sustained run.
 
-**Fair comparison:** close other programs, use the official power supply, add a heatsink or
-fan (thermal throttling inflates p95), and check `vcgencmd get_throttled` returns `0x0`
-after the run.
+Accuracy doesn't need re-running on the Pi. Embeddings are deterministic, so accuracy comes
+from the full LFW run on any machine.
+
+**Power:** a Pi 5 reports board power from its PMIC (`vcgencmd pmic_read_adc`). A Pi 4 has no
+on-board sensor, so its power fields come back `null`. Record power with a USB-C meter instead
+and add it to the JSON by hand, noting the meter you used.
+
+**Fair comparison:**
+* Close other programs and use the official power supply.
+* Note whether a heatsink or fan is fitted. Thermal throttling is exactly what the sustained
+  run is designed to expose, so report it either way.
+* A throttle value other than `0x0` means the run hit under-voltage or thermal limits. Keep
+  the result, and say so in the write-up.
 
 ## 3. Live demo (optional)
 

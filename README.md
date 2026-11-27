@@ -4,32 +4,39 @@ An on-device facial verification and evaluation lab built from a 2022 Raspberry 
 
 The [2022 archive](legacy/2022/) contains the recovered Tkinter, dlib and GPIO implementation. The current lab uses YuNet for detection, five-point alignment and SFace for embeddings. The evaluation tools compare FP32 and INT8 SFace and measure how much capture quality and threshold choice change results.
 
-## The study: how well does face verification work on a £50 device, and for whom?
+## The study: who gets locked out, and who gets let in?
 
-The main result of this repository is a benchmarking study on LFW (6,000 pairs, 4,281 people).
-It compares the 2022 lock's dlib matcher with SFace FP32 and INT8, using out-of-sample error
-rates, cost-based thresholds, bootstrap confidence intervals and subgroup analysis.
-**Read the write-up: [reports/findings.md](reports/findings.md).**
+The main result of this repository is a fairness and edge-cost study of face verification for a
+£50 smart lock. It compares the 2022 lock's dlib matcher with SFace FP32 and INT8 on four public
+benchmarks (LFW, CFP-FF, CFP-FP and CelebA: 5,781 people, 22,396 pairs), with
+identity-disjoint cross-calibration, fixed-FAR thresholds set on dense stranger sets (up to 7.6M
+pairs per half), and person-level bootstrap intervals.
+**Read the paper-style write-up: [reports/findings.md](reports/findings.md)**, or the generated
+[results tables](reports/tables.md).
 
-| | dlib (2022) | SFace FP32 | SFace INT8 |
+| LFW, threshold fixed at FAR 0.1% | dlib (2022) | SFace FP32 | SFace INT8 |
 | --- | ---: | ---: | ---: |
-| Equal error rate | 1.37% | **0.80%** | 0.87% |
-| False accepts, cost-based threshold | 0.37% | **0.10%** | 0.10% |
-| False accepts, same-ethnicity strangers (worst group) | **9.4%** (Asian) | 0.40% (Black) | 0.35% (Indian) |
-| Median latency (x86, 1 thread) | 120 ms | **38 ms** | 44 ms |
+| Owner locked out (FRR) | 8.7% | **1.5%** | 1.7% |
+| Same-ethnicity strangers let in, worst group | **6.0%** (Asian) | 0.46% (Black) | 0.43% (Black) |
+| Same-ethnicity strangers let in, White | 0.04% | 0.12% | 0.12% |
+| Women rejected vs men | 1.0× | 2.5× | 2.0× |
+| Profile faces rejected (CFP-FP) | 86% | 27% | 31% |
+| Median latency (x86, 1 thread) | 136 ms | **43 ms** | 46 ms |
 | Model size | 31.6 MB | 38.9 MB | **10.1 MB** |
 
-![DET curves](reports/figures/det_curves.png)
+![False accepts by subgroup](reports/figures/subgroups_far_far1e-3.png)
 
 ```sh
 python -m pip install -e ".[study,legacy,tracking]"  # legacy builds dlib (slow); tracking adds MLflow
-edgeauth-study run                                   # fetch LFW, embed, analyse, benchmark, plot
+edgeauth-study run                                   # LFW: prepare, embed, analyse, benchmark, plot
+edgeauth-study --dataset cfp-fp run                  # also cfp-ff, celeba; rfw / bfw with --source
 ```
 
 Each stage caches its output under `.edgeauth-study/`. Results are written to
-`reports/results/` and figures to `reports/figures/`. With MLflow installed, every run is also
-logged (`mlflow ui`). See [MODEL_CARD.md](MODEL_CARD.md) for intended use and limitations,
-and [pi/](pi/) to reproduce the edge benchmark and run the live door demo on a Raspberry Pi.
+`reports/results/`, figures to `reports/figures/`, and tables to `reports/tables.md`. With
+MLflow installed, every run is also logged (`mlflow ui`). See [MODEL_CARD.md](MODEL_CARD.md)
+for intended use and limitations, and [pi/](pi/) to reproduce the edge and thermal benchmark,
+or run the live door demo, on a Raspberry Pi.
 
 ## The verification lab
 
@@ -121,7 +128,7 @@ Model files are fetched from project-owned sources and are excluded from this re
 - [LFW](https://vis-www.cs.umass.edu/lfw/) and its [attribute labels](https://www.cs.columbia.edu/CAVE/databases/pubfig/download/lfw_attributes.txt) are downloaded at run time for research use and are never committed.
 
 ```sh
-python -m pip install -e ".[dev,dashboard]"
+python -m pip install -e ".[dev,dashboard,study]"
 ruff check src dashboard tests pi
 ruff format --check src dashboard tests pi
 pytest -q
