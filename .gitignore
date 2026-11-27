@@ -1,0 +1,14 @@
+# Sensitive biometric data and generated data
+**/dataset/
+**/encodings.pickle
+*.pickle
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
