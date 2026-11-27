@@ -12,3 +12,19 @@ venv/
 .env
 .env.*
 !.env.example
+
+# EdgeAuth local inputs, artifacts and runtime state
+.edgeauth/
+data/
+models/
+reports/
+*.onnx
+*.sqlite*
+*.npy
+*.npz
+*.key
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
