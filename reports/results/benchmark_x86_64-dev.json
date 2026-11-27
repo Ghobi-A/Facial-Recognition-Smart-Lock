@@ -1,0 +1,45 @@
+{
+  "device": {
+    "machine": "x86_64",
+    "system": "Linux",
+    "python": "3.13.18",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "opencv": "4.14.0"
+  },
+  "warmup": 10,
+  "models": {
+    "dlib-legacy": {
+      "probes": 200,
+      "latency_ms_p50": 120.0878654999542,
+      "latency_ms_p95": 141.37062305011335,
+      "throughput_fps": 8.338180478502549,
+      "peak_rss_mb": 213.9375,
+      "model_rss_mb": 12.40625,
+      "power_w_idle": null,
+      "power_w_load": null,
+      "model_bytes": 31616555
+    },
+    "sface-fp32": {
+      "probes": 200,
+      "latency_ms_p50": 37.70952150011908,
+      "latency_ms_p95": 47.07786749989964,
+      "throughput_fps": 25.819363223470912,
+      "peak_rss_mb": 201.53125,
+      "model_rss_mb": 0.0,
+      "power_w_idle": null,
+      "power_w_load": null,
+      "model_bytes": 38928942
+    },
+    "sface-int8": {
+      "probes": 200,
+      "latency_ms_p50": 44.25453149997338,
+      "latency_ms_p95": 54.71488120009552,
+      "throughput_fps": 23.053864005404442,
+      "peak_rss_mb": 201.53125,
+      "model_rss_mb": 0.0,
+      "power_w_idle": null,
+      "power_w_load": null,
+      "model_bytes": 10129522
+    }
+  }
+}

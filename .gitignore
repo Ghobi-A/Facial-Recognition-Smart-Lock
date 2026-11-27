@@ -17,7 +17,9 @@ venv/
 .edgeauth/
 data/
 models/
-reports/
+reports/local/
+.edgeauth-study/
+mlruns/
 *.onnx
 *.sqlite*
 *.npy

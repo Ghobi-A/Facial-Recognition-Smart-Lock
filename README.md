@@ -4,6 +4,35 @@ An on-device facial verification and evaluation lab built from a 2022 Raspberry 
 
 The [2022 archive](legacy/2022/) contains the recovered Tkinter, dlib and GPIO implementation. The current lab uses YuNet for detection, five-point alignment and SFace for embeddings. The evaluation tools compare FP32 and INT8 SFace and measure how much capture quality and threshold choice change results.
 
+## The study: how well does face verification work on a £50 device, and for whom?
+
+The main result of this repository is a benchmarking study on LFW (6,000 pairs, 4,281 people).
+It compares the 2022 lock's dlib matcher with SFace FP32 and INT8, using out-of-sample error
+rates, cost-based thresholds, bootstrap confidence intervals and subgroup analysis.
+**Read the write-up: [reports/findings.md](reports/findings.md).**
+
+| | dlib (2022) | SFace FP32 | SFace INT8 |
+| --- | ---: | ---: | ---: |
+| Equal error rate | 1.37% | **0.80%** | 0.87% |
+| False accepts, cost-based threshold | 0.37% | **0.10%** | 0.10% |
+| False accepts, same-ethnicity strangers (worst group) | **9.4%** (Asian) | 0.40% (Black) | 0.35% (Indian) |
+| Median latency (x86, 1 thread) | 120 ms | **38 ms** | 44 ms |
+| Model size | 31.6 MB | 38.9 MB | **10.1 MB** |
+
+![DET curves](reports/figures/det_curves.png)
+
+```sh
+python -m pip install -e ".[study,legacy,tracking]"  # legacy builds dlib (slow); tracking adds MLflow
+edgeauth-study run                                   # fetch LFW, embed, analyse, benchmark, plot
+```
+
+Each stage caches its output under `.edgeauth-study/`. Results are written to
+`reports/results/` and figures to `reports/figures/`. With MLflow installed, every run is also
+logged (`mlflow ui`). See [MODEL_CARD.md](MODEL_CARD.md) for intended use and limitations,
+and [pi/](pi/) to reproduce the edge benchmark and run the live door demo on a Raspberry Pi.
+
+## The verification lab
+
 | Capability | Implementation |
 | --- | --- |
 | 1:1 verification | Three-capture enrolment, normalized template centroid and cosine comparison against one claimed identity |
@@ -79,14 +108,7 @@ The dashboard opens with synthetic example scores. Load an evaluation, PAD or la
 
 The lab is for a trusted local operator evaluating an untrusted capture. A still-image PAD classifier can screen some presentations. Its output cannot establish trusted sensor capture or stop arbitrary camera-stream injection. The project does not connect to a lock or expose a remote verification endpoint. Physical entry or account authentication would require a trusted capture path, a possession factor such as a passkey, retry controls, a fallback and independent PAD and accuracy testing. See [NIST SP 800-63B-4](https://pages.nist.gov/800-63-4/sp800-63b.html#biometrics) for the standard behind those deployment requirements.
 
-A local x86-64 Linux smoke benchmark (OpenCV 4.14, one CPU thread, one public sample image, 5 warm-up and 30 measured runs) produced the following results.
-
-| SFace weights | Recognition weights | Pipeline p50 | Pipeline p95 |
-| --- | ---: | ---: | ---: |
-| FP32 | 38.7 MB | 52.2 ms | 53.0 ms |
-| INT8 | 9.9 MB | 46.7 ms | 48.2 ms |
-
-INT8 cut the recognizer weight size by 74% and the measured median pipeline latency by 11% on this input. Operational biometric accuracy, demographic performance, PAD coverage and Raspberry Pi latency require suitable datasets and hardware. The initial comparison covers two SFace precisions. dlib, ArcFace and FaceNet are separate comparison candidates.
+Accuracy, demographic performance and latency are measured in the [LFW study](reports/findings.md). PAD coverage and Raspberry Pi latency still need a labelled attack dataset and the target hardware.
 
 ## Model provenance
 
@@ -95,10 +117,12 @@ Model files are fetched from project-owned sources and are excluded from this re
 - [YuNet, OpenCV Zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) lists MIT terms.
 - [SFace, OpenCV Zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface) lists Apache 2.0 terms.
 - [Anti-Spoof MN3, Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/anti-spoof-mn3) lists MIT terms for the original model.
+- [dlib face recognition model](https://github.com/ageitgey/face_recognition_models), used only as the 2022 baseline, is CC0.
+- [LFW](https://vis-www.cs.umass.edu/lfw/) and its [attribute labels](https://www.cs.columbia.edu/CAVE/databases/pubfig/download/lfw_attributes.txt) are downloaded at run time for research use and are never committed.
 
 ```sh
 python -m pip install -e ".[dev,dashboard]"
-ruff check src dashboard tests
-ruff format --check src dashboard tests
+ruff check src dashboard tests pi
+ruff format --check src dashboard tests pi
 pytest -q
 ```
